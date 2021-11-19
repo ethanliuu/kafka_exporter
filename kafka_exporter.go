@@ -32,13 +32,12 @@ const (
 	namespace = "kafka"
 	clientID  = "kafka_exporter"
 )
-
-const (
-	INFO  = 0
-	DEBUG = 1
-	TRACE = 2
+var lastOffset = make(map[string]map[string]int64)
+var  topicOffset = make(map[string]int64)
+var (
+	lastScrape int64
+	start bool=true
 )
-
 var (
 	clusterBrokers                     *prometheus.Desc
 	topicPartitions                    *prometheus.Desc
@@ -52,7 +51,8 @@ var (
 	consumergroupCurrentOffset         *prometheus.Desc
 	consumergroupCurrentOffsetSum      *prometheus.Desc
 	consumergroupLag                   *prometheus.Desc
-	consumergroupLagSum                *prometheus.Desc
+	//consumergroupLagSum                *prometheus.Desc
+	consumergroupLagSumRate				*prometheus.Desc
 	consumergroupLagZookeeper          *prometheus.Desc
 	consumergroupMembers               *prometheus.Desc
 )
@@ -84,17 +84,10 @@ type kafkaOpts struct {
 	saslUsername             string
 	saslPassword             string
 	saslMechanism            string
-	saslDisablePAFXFast      bool
 	useTLS                   bool
-	tlsServerName            string
 	tlsCAFile                string
 	tlsCertFile              string
 	tlsKeyFile               string
-	serverUseTLS             bool
-	serverMutualAuthEnabled  bool
-	serverTlsCAFile          string
-	serverTlsCertFile        string
-	serverTlsKeyFile         string
 	tlsInsecureSkipTLSVerify bool
 	kafkaVersion             string
 	useZooKeeperLag          bool
@@ -180,9 +173,6 @@ func NewExporter(opts kafkaOpts, topicFilter string, groupFilter string) (*Expor
 				config.Net.SASL.GSSAPI.AuthType = sarama.KRB5_USER_AUTH
 				config.Net.SASL.GSSAPI.Password = opts.saslPassword
 			}
-			if opts.saslDisablePAFXFast {
-				config.Net.SASL.GSSAPI.DisablePAFXFAST = true
-			}
 		case "plain":
 		default:
 			return nil, fmt.Errorf(
@@ -207,7 +197,6 @@ func NewExporter(opts kafkaOpts, topicFilter string, groupFilter string) (*Expor
 		config.Net.TLS.Enable = true
 
 		config.Net.TLS.Config = &tls.Config{
-			ServerName:         opts.tlsServerName,
 			RootCAs:            x509.NewCertPool(),
 			InsecureSkipVerify: opts.tlsInsecureSkipTLSVerify,
 		}
@@ -235,7 +224,7 @@ func NewExporter(opts kafkaOpts, topicFilter string, groupFilter string) (*Expor
 	}
 
 	if opts.useZooKeeperLag {
-		glog.V(DEBUG).Infoln("Using zookeeper lag, so connecting to zookeeper")
+		glog.Infoln("Using zookeeper lag, so connecting to zookeeper")
 		zookeeperClient, err = kazoo.NewKazoo(opts.uriZookeeper, nil)
 		if err != nil {
 			return nil, errors.Wrap(err, "error connecting to zookeeper")
@@ -255,7 +244,7 @@ func NewExporter(opts kafkaOpts, topicFilter string, groupFilter string) (*Expor
 		return nil, errors.Wrap(err, "Error Init Kafka Client")
 	}
 
-	glog.V(TRACE).Infoln("Done Init Clients")
+	glog.Infoln("Done Init Clients")
 	// Init our exporter.
 	return &Exporter{
 		client:                  client,
@@ -303,11 +292,9 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- consumergroupCurrentOffsetSum
 	ch <- consumergroupLag
 	ch <- consumergroupLagZookeeper
-	ch <- consumergroupLagSum
+	//ch <- consumergroupLagSum
 }
 
-// Collect fetches the stats from configured Kafka location and delivers them
-// as Prometheus metrics. It implements prometheus.Collector.
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	if e.allowConcurrent {
 		e.collect(ch)
@@ -316,12 +303,12 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	// Locking to avoid race add
 	e.sgMutex.Lock()
 	e.sgChans = append(e.sgChans, ch)
-	// Safe to compare length since we own the Lock
+	// Safe to compare lenght since we own the Lock
 	if len(e.sgChans) == 1 {
 		e.sgWaitCh = make(chan struct{})
 		go e.collectChans(e.sgWaitCh)
 	} else {
-		glog.V(TRACE).Info("concurrent calls detected, waiting for first to finish")
+		glog.Info("concurrent calls detected, waiting for first to finish")
 	}
 	// Put in another variable to ensure not overwriting it in another Collect once we wait
 	waiter := e.sgWaitCh
@@ -331,6 +318,8 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	// collectChan finished
 }
 
+// Collect fetches the stats from configured Kafka location and delivers them
+// as Prometheus metrics. It implements prometheus.Collector.
 func (e *Exporter) collectChans(quit chan struct{}) {
 	original := make(chan prometheus.Metric)
 	container := make([]prometheus.Metric, 0, 100)
@@ -357,17 +346,24 @@ func (e *Exporter) collectChans(quit chan struct{}) {
 }
 
 func (e *Exporter) collect(ch chan<- prometheus.Metric) {
+
+	// 距离上次消费了多少
+	var consume int64
+	// 距离上次消费速率
+	var consumeRate float64
+	var consumeTime float64
 	var wg = sync.WaitGroup{}
 	ch <- prometheus.MustNewConstMetric(
 		clusterBrokers, prometheus.GaugeValue, float64(len(e.client.Brokers())),
 	)
-
+	// offset字典里存储的是各topic的各分区下一个offset的值
 	offset := make(map[string]map[int32]int64)
+	topicsPartitions := make(map[string][]int32)
 
 	now := time.Now()
 
 	if now.After(e.nextMetadataRefresh) {
-		glog.V(DEBUG).Info("Refreshing client metadata")
+		glog.Info("Refreshing client metadata")
 
 		if err := e.client.RefreshMetadata(); err != nil {
 			glog.Errorf("Cannot refresh topics, using cached data: %v", err)
@@ -375,13 +371,13 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 
 		e.nextMetadataRefresh = now.Add(e.metadataRefreshInterval)
 	}
-
+	// 获取topic列表
 	topics, err := e.client.Topics()
 	if err != nil {
 		glog.Errorf("Cannot get topics: %v", err)
 		return
 	}
-
+	//glog.Infoln("获取topic列表")
 	topicChannel := make(chan string)
 
 	getTopicMetrics := func(topic string) {
@@ -390,8 +386,9 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 		if !e.topicFilter.MatchString(topic) {
 			return
 		}
-
+		// 获取该topic的分区列表
 		partitions, err := e.client.Partitions(topic)
+		//glog.Infoln("获取topic 分区列表")
 		if err != nil {
 			glog.Errorf("Cannot get partitions of topic %s: %v", topic, err)
 			return
@@ -400,7 +397,10 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 			topicPartitions, prometheus.GaugeValue, float64(len(partitions)), topic,
 		)
 		e.mu.Lock()
+		// topic 的分区数量作为容量
 		offset[topic] = make(map[int32]int64, len(partitions))
+		topicsPartitions[topic] = partitions
+		//glog.Infoln("添加分区列表完毕")
 		e.mu.Unlock()
 		for _, partition := range partitions {
 			broker, err := e.client.Leader(topic, partition)
@@ -411,12 +411,13 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 					topicPartitionLeader, prometheus.GaugeValue, float64(broker.ID()), topic, strconv.FormatInt(int64(partition), 10),
 				)
 			}
-
+			// 获取最新的生产offset值
 			currentOffset, err := e.client.GetOffset(topic, partition, sarama.OffsetNewest)
 			if err != nil {
 				glog.Errorf("Cannot get current offset of topic %s partition %d: %v", topic, partition, err)
 			} else {
 				e.mu.Lock()
+				// topic各分区最新的漂移值
 				offset[topic][partition] = currentOffset
 				e.mu.Unlock()
 				ch <- prometheus.MustNewConstMetric(
@@ -490,6 +491,7 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 				}
 			}
 		}
+		//glog.Infoln("获取数据完毕")
 	}
 
 	loopTopics := func(id int) {
@@ -512,11 +514,13 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 	}
 
 	N := minx(len(topics)/2, e.topicWorkers)
+
 	for w := 1; w <= N; w++ {
 		go loopTopics(w)
 	}
 
 	for _, topic := range topics {
+		// 匹配需要抓取的topic
 		if e.topicFilter.MatchString(topic) {
 			wg.Add(1)
 			topicChannel <- topic
@@ -528,34 +532,52 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 
 	getConsumerGroupMetrics := func(broker *sarama.Broker) {
 		defer wg.Done()
+		// 建立kafka broker连接
+
+		var timeDiff int64
+		time := time.Now().Unix()
+		if start== true {
+			timeDiff = 0
+		}else {
+			timeDiff = time - lastScrape
+		}
+	//	glog.Infoln("timeDiff,",timeDiff)
 		if err := broker.Open(e.client.Config()); err != nil && err != sarama.ErrAlreadyConnected {
 			glog.Errorf("Cannot connect to broker %d: %v", broker.ID(), err)
 			return
 		}
+		//glog.Infoln("建立kafka broker连接")
 		defer broker.Close()
-
+		// 获取该broker的groups信息
 		groups, err := broker.ListGroups(&sarama.ListGroupsRequest{})
 		if err != nil {
 			glog.Errorf("Cannot get consumer group: %v", err)
 			return
 		}
+		//glog.Infoln("获取该broker的groups信息",groups)
 		groupIds := make([]string, 0)
+		// 将groups添加到groups切片
 		for groupId := range groups.Groups {
 			if e.groupFilter.MatchString(groupId) {
 				groupIds = append(groupIds, groupId)
 			}
 		}
+		//log.Infoln("将groups添加到groups切片",groupIds)
+
 
 		describeGroups, err := broker.DescribeGroups(&sarama.DescribeGroupsRequest{Groups: groupIds})
 		if err != nil {
 			glog.Errorf("Cannot get describe groups: %v", err)
 			return
 		}
+		//glog.Infoln(" broker.DescribeGroups")
 		for _, group := range describeGroups.Groups {
 			offsetFetchRequest := sarama.OffsetFetchRequest{ConsumerGroup: group.GroupId, Version: 1}
+			// 如果获取所有topic
 			if e.offsetShowAll {
-				for topic, partitions := range offset {
-					for partition := range partitions {
+				for topic, partitions := range topicsPartitions {
+					for _, partition := range partitions {
+						// 将topic和对应的分区号添加到offsetFetchRequest的map里
 						offsetFetchRequest.AddPartition(topic, partition)
 					}
 				}
@@ -576,6 +598,7 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 			ch <- prometheus.MustNewConstMetric(
 				consumergroupMembers, prometheus.GaugeValue, float64(len(group.Members)), group.GroupId,
 			)
+			// 获取消费位移
 			offsetFetchResponse, err := broker.FetchOffset(&offsetFetchRequest)
 			if err != nil {
 				glog.Errorf("Cannot get offset of group %s: %v", group.GroupId, err)
@@ -586,16 +609,17 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 				// If the topic is not consumed by that consumer group, skip it
 				topicConsumed := false
 				for _, offsetFetchResponseBlock := range partitions {
+					// 如果消费者组下没有与topic partition 关联的偏移量，Kafka将返回-1
 					// Kafka will return -1 if there is no offset associated with a topic-partition under that consumer group
 					if offsetFetchResponseBlock.Offset != -1 {
 						topicConsumed = true
 						break
 					}
 				}
+				// 如果有未关联的topic与partition，跳出此次循环
 				if !topicConsumed {
 					continue
 				}
-
 				var currentOffsetSum int64
 				var lagSum int64
 				for partition, offsetFetchResponseBlock := range partitions {
@@ -604,41 +628,77 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 						glog.Errorf("Error for  partition %d :%v", partition, err.Error())
 						continue
 					}
+					// 获取当前分区的消费位移
 					currentOffset := offsetFetchResponseBlock.Offset
-					currentOffsetSum += currentOffset
+					// 所有分区的消费偏移量加起来
+					if currentOffset != -1 {
+						currentOffsetSum += currentOffset
+					}
 					ch <- prometheus.MustNewConstMetric(
 						consumergroupCurrentOffset, prometheus.GaugeValue, float64(currentOffset), group.GroupId, topic, strconv.FormatInt(int64(partition), 10),
 					)
-					e.mu.Lock()
-					if offset, ok := offset[topic][partition]; ok {
-						// If the topic is consumed by that consumer group, but no offset associated with the partition
+
+					currentOffset, error := e.client.GetOffset(topic, partition, sarama.OffsetNewest)
+					if error != nil {
+						glog.Errorf("Cannot get current offset of topic %s partition %d: %v", topic, partition, err)
+					}
+
+					// If the topic is consumed by that consumer group, but no offset associated with the partition
 						// forcing lag to -1 to be able to alert on that
 						var lag int64
 						if offsetFetchResponseBlock.Offset == -1 {
 							lag = -1
 						} else {
-							lag = offset - offsetFetchResponseBlock.Offset
+							// 积压=生产位移-消费位移
+							lag = currentOffset - offsetFetchResponseBlock.Offset
 							lagSum += lag
 						}
 						ch <- prometheus.MustNewConstMetric(
 							consumergroupLag, prometheus.GaugeValue, float64(lag), group.GroupId, topic, strconv.FormatInt(int64(partition), 10),
 						)
-					} else {
-						glog.Errorf("No offset of topic %s partition %d, cannot get consumer group lag", topic, partition)
-					}
-					e.mu.Unlock()
+
+
 				}
+				// 速度的计算要用消费偏移
+				if start == false {
+					consume = currentOffsetSum - lastOffset[group.GroupId][topic]
+					if group.GroupId =="base-data-redis-0412"{
+						glog.Infoln("last===",lastOffset[group.GroupId][topic],"currentOffset==",currentOffsetSum,"consume===",consume)
+					}
+					//glog.Infoln("consume:",consume)
+					if consume <= 0 {
+						consumeRate = 0
+						consumeTime= -1
+					}else {
+						consumeRate = float64(consume) / float64(timeDiff)
+						consumeTime = float64(currentOffsetSum) / consumeRate
+					}
+				}else {
+					consumeRate = -1
+					consumeTime = -2
+				}
+				e.mu.Lock()
+				topicOffset[topic] = currentOffsetSum
+				lastOffset[group.GroupId] = topicOffset
+				e.mu.Unlock()
+				//glog.Infoln("consumeTime: ",consumeTime)
+				ch <- prometheus.MustNewConstMetric(
+					consumergroupLagSumRate,prometheus.GaugeValue,float64(lagSum),group.GroupId,topic,strconv.FormatFloat(consumeRate,'f',1,64),strconv.FormatFloat(consumeTime,'f',0,64),strconv.Itoa(int(timeDiff)))
 				ch <- prometheus.MustNewConstMetric(
 					consumergroupCurrentOffsetSum, prometheus.GaugeValue, float64(currentOffsetSum), group.GroupId, topic,
 				)
-				ch <- prometheus.MustNewConstMetric(
-					consumergroupLagSum, prometheus.GaugeValue, float64(lagSum), group.GroupId, topic,
-				)
+				//ch <- prometheus.MustNewConstMetric(
+				//	consumergroupLagSum, prometheus.GaugeValue, float64(lagSum), group.GroupId, topic,
+				//)
+				if group.GroupId =="base-data-redis-0412"{
+					glog.Infoln("first===","last===",lastOffset[group.GroupId][topic],"currentOffset==",currentOffsetSum,)
+				}
 			}
 		}
+		//glog.Infoln("结束")
 	}
 
-	glog.V(DEBUG).Info("Fetching consumer group metrics")
+	glog.Info("Fetching consumer group metrics")
 	if len(e.client.Brokers()) > 0 {
 		for _, broker := range e.client.Brokers() {
 			wg.Add(1)
@@ -648,91 +708,56 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 	} else {
 		glog.Errorln("No valid broker, cannot get consumer group metrics")
 	}
+	lastScrape = time.Now().Unix()
+	start = false
 }
 
 func init() {
 	metrics.UseNilMetrics = true
 	prometheus.MustRegister(version.NewCollector("kafka_exporter"))
 }
+
 func toFlag(name string, help string) *kingpin.FlagClause {
 	flag.CommandLine.String(name, "", help) // hack around flag.Parse and glog.init flags
 	return kingpin.Flag(name, help)
 }
 
-// hack around flag.Parse and glog.init flags
-func toFlagString(name string, help string, value string) *string {
-	flag.CommandLine.String(name, value, help) // hack around flag.Parse and glog.init flags
-	return kingpin.Flag(name, help).Default(value).String()
-}
-
-func toFlagBool(name string, help string, value bool, valueString string) *bool {
-	flag.CommandLine.Bool(name, value, help) // hack around flag.Parse and glog.init flags
-	return kingpin.Flag(name, help).Default(valueString).Bool()
-}
-
-func toFlagStringsVar(name string, help string, value string, target *[]string) {
-	flag.CommandLine.String(name, value, help) // hack around flag.Parse and glog.init flags
-	kingpin.Flag(name, help).Default(value).StringsVar(target)
-}
-
-func toFlagStringVar(name string, help string, value string, target *string) {
-	flag.CommandLine.String(name, value, help) // hack around flag.Parse and glog.init flags
-	kingpin.Flag(name, help).Default(value).StringVar(target)
-}
-
-func toFlagBoolVar(name string, help string, value bool, valueString string, target *bool) {
-	flag.CommandLine.Bool(name, value, help) // hack around flag.Parse and glog.init flags
-	kingpin.Flag(name, help).Default(valueString).BoolVar(target)
-}
-
-func toFlagIntVar(name string, help string, value int, valueString string, target *int) {
-	flag.CommandLine.Int(name, value, help) // hack around flag.Parse and glog.init flags
-	kingpin.Flag(name, help).Default(valueString).IntVar(target)
-}
-
 func main() {
 	var (
-		listenAddress = toFlagString("web.listen-address", "Address to listen on for web interface and telemetry.", ":9308")
-		metricsPath   = toFlagString("web.telemetry-path", "Path under which to expose metrics.", "/metrics")
-		topicFilter   = toFlagString("topic.filter", "Regex that determines which topics to collect.", ".*")
-		groupFilter   = toFlagString("group.filter", "Regex that determines which consumer groups to collect.", ".*")
-		logSarama     = toFlagBool("log.enable-sarama", "Turn on Sarama logging.", false, "false")
+		listenAddress = toFlag("web.listen-address", "Address to listen on for web interface and telemetry.").Default(":9308").String()
+		metricsPath   = toFlag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
+		topicFilter   = toFlag("topic.filter", "Regex that determines which topics to collect.").Default(".*").String()
+		groupFilter   = toFlag("group.filter", "Regex that determines which consumer groups to collect.").Default(".*").String()
+		logSarama     = toFlag("log.enable-sarama", "Turn on Sarama logging.").Default("false").Bool()
 
 		opts = kafkaOpts{}
 	)
 
-	toFlagStringsVar("kafka.server", "Address (host:port) of Kafka server.", "kafka:9092", &opts.uri)
-	toFlagBoolVar("sasl.enabled", "Connect using SASL/PLAIN.", false, "false", &opts.useSASL)
-	toFlagBoolVar("sasl.handshake", "Only set this to false if using a non-Kafka SASL proxy.", true, "true", &opts.useSASLHandshake)
-	toFlagStringVar("sasl.username", "SASL user name.", "", &opts.saslUsername)
-	toFlagStringVar("sasl.password", "SASL user password.", "", &opts.saslPassword)
-	toFlagStringVar("sasl.mechanism", "The SASL SCRAM SHA algorithm sha256 or sha512 or gssapi as mechanism", "", &opts.saslMechanism)
-	toFlagStringVar("sasl.service-name", "Service name when using kerberos Auth", "", &opts.serviceName)
-	toFlagStringVar("sasl.kerberos-config-path", "Kerberos config path", "", &opts.kerberosConfigPath)
-	toFlagStringVar("sasl.realm", "Kerberos realm", "", &opts.realm)
-	toFlagStringVar("sasl.kerberos-auth-type", "Kerberos auth type. Either 'keytabAuth' or 'userAuth'", "", &opts.kerberosAuthType)
-	toFlagStringVar("sasl.keytab-path", "Kerberos keytab file path", "", &opts.keyTabPath)
-	toFlagBoolVar("sasl.disable-PA-FX-FAST", "Configure the Kerberos client to not use PA_FX_FAST.", false, "false", &opts.saslDisablePAFXFast)
-	toFlagBoolVar("tls.enabled", "Connect to Kafka using TLS.", false, "false", &opts.useTLS)
-	toFlagStringVar("tls.server-name", "Used to verify the hostname on the returned certificates unless tls.insecure-skip-tls-verify is given. The kafka server's name should be given.", "", &opts.tlsServerName)
-	toFlagStringVar("tls.ca-file", "The optional certificate authority file for Kafka TLS client authentication.", "", &opts.tlsCAFile)
-	toFlagStringVar("tls.cert-file", "The optional certificate file for Kafka client authentication.", "", &opts.tlsCertFile)
-	toFlagStringVar("tls.key-file", "The optional key file for Kafka client authentication.", "", &opts.tlsKeyFile)
-	toFlagBoolVar("server.tls.enabled", "Enable TLS for web server.", false, "false", &opts.serverUseTLS)
-	toFlagBoolVar("server.tls.mutual-auth-enabled", "Enable TLS client mutual authentication.", false, "false", &opts.serverMutualAuthEnabled)
-	toFlagStringVar("server.tls.ca-file", "The certificate authority file for the web server.", "", &opts.serverTlsCAFile)
-	toFlagStringVar("server.tls.cert-file", "The certificate file for the web server.", "", &opts.serverTlsCertFile)
-	toFlagStringVar("server.tls.key-file", "The key file for the web server.", "", &opts.serverTlsKeyFile)
-	toFlagBoolVar("tls.insecure-skip-tls-verify", "If true, the server's certificate will not be checked for validity. This will make your HTTPS connections insecure.", false, "false", &opts.tlsInsecureSkipTLSVerify)
-	toFlagStringVar("kafka.version", "Kafka broker version", sarama.V2_0_0_0.String(), &opts.kafkaVersion)
-	toFlagBoolVar("use.consumelag.zookeeper", "if you need to use a group from zookeeper", false, "false", &opts.useZooKeeperLag)
-	toFlagStringsVar("zookeeper.server", "Address (hosts) of zookeeper server.", "localhost:2181", &opts.uriZookeeper)
-	toFlagStringVar("kafka.labels", "Kafka cluster name", "", &opts.labels)
-	toFlagStringVar("refresh.metadata", "Metadata refresh interval", "30s", &opts.metadataRefreshInterval)
-	toFlagBoolVar("offset.show-all", "Whether show the offset/lag for all consumer group, otherwise, only show connected consumer groups", true, "true", &opts.offsetShowAll)
-	toFlagBoolVar("concurrent.enable", "If true, all scrapes will trigger kafka operations otherwise, they will share results. WARN: This should be disabled on large clusters", false, "false", &opts.allowConcurrent)
-	toFlagIntVar("topic.workers", "Number of topic workers", 100, "100", &opts.topicWorkers)
-	toFlagIntVar("verbosity", "Verbosity log level", 0, "0", &opts.verbosityLogLevel)
+	toFlag("kafka.server", "Address (host:port) of Kafka server.").Default("kafka:9092").StringsVar(&opts.uri)
+	toFlag("sasl.enabled", "Connect using SASL/PLAIN.").Default("false").BoolVar(&opts.useSASL)
+	toFlag("sasl.handshake", "Only set this to false if using a non-Kafka SASL proxy.").Default("true").BoolVar(&opts.useSASLHandshake)
+	toFlag("sasl.username", "SASL user name.").Default("").StringVar(&opts.saslUsername)
+	toFlag("sasl.password", "SASL user password.").Default("").StringVar(&opts.saslPassword)
+	toFlag("sasl.mechanism", "The SASL SCRAM SHA algorithm sha256 or sha512 or gssapi as mechanism").Default("").StringVar(&opts.saslMechanism)
+	toFlag("sasl.service-name", "Service name when using kerberos Auth").Default("").StringVar(&opts.serviceName)
+	toFlag("sasl.kerberos-config-path", "Kerberos config path").Default("").StringVar(&opts.kerberosConfigPath)
+	toFlag("sasl.realm", "Kerberos realm").Default("").StringVar(&opts.realm)
+	toFlag("sasl.kerberos-auth-type", "Kerberos auth type. Either 'keytabAuth' or 'userAuth'").Default("").StringVar(&opts.kerberosAuthType)
+	toFlag("sasl.keytab-path", "Kerberos keytab file path").Default("").StringVar(&opts.keyTabPath)
+	toFlag("tls.enabled", "Connect using TLS.").Default("false").BoolVar(&opts.useTLS)
+	toFlag("tls.ca-file", "The optional certificate authority file for TLS client authentication.").Default("").StringVar(&opts.tlsCAFile)
+	toFlag("tls.cert-file", "The optional certificate file for client authentication.").Default("").StringVar(&opts.tlsCertFile)
+	toFlag("tls.key-file", "The optional key file for client authentication.").Default("").StringVar(&opts.tlsKeyFile)
+	toFlag("tls.insecure-skip-tls-verify", "If true, the server's certificate will not be checked for validity. This will make your HTTPS connections insecure.").Default("false").BoolVar(&opts.tlsInsecureSkipTLSVerify)
+	toFlag("kafka.version", "Kafka broker version").Default(sarama.V2_0_0_0.String()).StringVar(&opts.kafkaVersion)
+	toFlag("use.consumelag.zookeeper", "if you need to use a group from zookeeper").Default("false").BoolVar(&opts.useZooKeeperLag)
+	toFlag("zookeeper.server", "Address (hosts) of zookeeper server.").Default("localhost:2181").StringsVar(&opts.uriZookeeper)
+	toFlag("kafka.labels", "Kafka cluster name").Default("").StringVar(&opts.labels)
+	toFlag("refresh.metadata", "Metadata refresh interval").Default("30s").StringVar(&opts.metadataRefreshInterval)
+	toFlag("offset.show-all", "Whether show the offset/lag for all consumer group, otherwise, only show connected consumer groups").Default("true").BoolVar(&opts.offsetShowAll)
+	toFlag("concurrent.enable", "If true, all scrapes will trigger kafka operations otherwise, they will share results. WARN: This should be disabled on large clusters").Default("false").BoolVar(&opts.allowConcurrent)
+	toFlag("topic.workers", "Number of topic workers").Default("100").IntVar(&opts.topicWorkers)
+	toFlag("verbosity", "Verbosity log level").Default("0").IntVar(&opts.verbosityLogLevel)
 
 	plConfig := plog.Config{}
 	plogflag.AddFlags(kingpin.CommandLine, &plConfig)
@@ -771,8 +796,8 @@ func setup(
 	flag.Parse()
 	defer glog.Flush()
 
-	glog.V(INFO).Infoln("Starting kafka_exporter", version.Info())
-	glog.V(DEBUG).Infoln("Build context", version.BuildContext())
+	glog.Infoln("Starting kafka_exporter", version.Info())
+	glog.Infoln("Build context", version.BuildContext())
 
 	clusterBrokers = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "", "brokers"),
@@ -849,11 +874,17 @@ func setup(
 		[]string{"consumergroup", "topic", "partition"}, nil,
 	)
 
-	consumergroupLagSum = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, "consumergroup", "lag_sum"),
-		"Current Approximate Lag of a ConsumerGroup at Topic for all partitions",
-		[]string{"consumergroup", "topic"}, labels,
-	)
+	//consumergroupLagSum = prometheus.NewDesc(
+	//	prometheus.BuildFQName(namespace, "consumergroup", "lag_sum"),
+	//	"Current Approximate Lag of a ConsumerGroup at Topic for all partitions",
+	//	[]string{"consumergroup", "topic"}, labels,
+	//)
+
+	consumergroupLagSumRate = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace,"consumergroup","lag_sum_rate"),
+		"",
+		[]string{"consumergroup","topic","rate","time","timeDiff"},labels,
+		)
 
 	consumergroupMembers = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "consumergroup", "members"),
@@ -887,51 +918,6 @@ func setup(
 		w.Write([]byte("ok"))
 	})
 
-	if opts.serverUseTLS {
-		glog.V(INFO).Infoln("Listening on HTTPS", listenAddress)
-
-		_, err := CanReadCertAndKey(opts.serverTlsCertFile, opts.serverTlsKeyFile)
-		if err != nil {
-			glog.Error("error reading server cert and key")
-		}
-
-		clientAuthType := tls.NoClientCert
-		if opts.serverMutualAuthEnabled {
-			clientAuthType = tls.RequireAndVerifyClientCert
-		}
-
-		certPool := x509.NewCertPool()
-		if opts.serverTlsCAFile != "" {
-			if caCert, err := ioutil.ReadFile(opts.serverTlsCAFile); err == nil {
-				certPool.AppendCertsFromPEM(caCert)
-			} else {
-				glog.Error("error reading server ca")
-			}
-		}
-
-		tlsConfig := &tls.Config{
-			ClientCAs:                certPool,
-			ClientAuth:               clientAuthType,
-			MinVersion:               tls.VersionTLS12,
-			CurvePreferences:         []tls.CurveID{tls.CurveP521, tls.CurveP384, tls.CurveP256},
-			PreferServerCipherSuites: true,
-			CipherSuites: []uint16{
-				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-				tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
-				tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_RSA_WITH_AES_256_CBC_SHA,
-				tls.TLS_RSA_WITH_AES_128_CBC_SHA256,
-			},
-		}
-		server := &http.Server{
-			Addr:      listenAddress,
-			TLSConfig: tlsConfig,
-		}
-		glog.Fatal(server.ListenAndServeTLS(opts.serverTlsCertFile, opts.serverTlsKeyFile))
-	} else {
-		glog.V(INFO).Infoln("Listening on HTTP", listenAddress)
-		glog.Fatal(http.ListenAndServe(listenAddress, nil))
-	}
+	glog.Infoln("Listening on", listenAddress)
+	glog.Fatal(http.ListenAndServe(listenAddress, nil))
 }
